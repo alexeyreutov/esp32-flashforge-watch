@@ -34,9 +34,14 @@ for x,y in case_mounts:
 # board's factory threaded bosses set the module height. No load on the LCD.
 lid_t = 2.4
 post = cavity - 8.2 - 0.4
+pcb_grip = 4.2  # M2x6 projects 1.8 mm into the board's threaded insert.
+seat_depth = lid_t + post - pcb_grip
 lid = block(W,H,lid_t,0,r=3.8)
 for x,y in pcb_mounts:
     lid = lid.union(cylinder(4.5,post,lid_t,x,y))
+    # Support the flat seat and leave the original narrow tip by the PCB.
+    lid = lid.union(cylinder(6.8,seat_depth+1.2-lid_t,lid_t,x,y))
+    lid = lid.cut(cylinder(4.8,seat_depth+1,-1,x,y))
     lid = lid.cut(cylinder(2.3,lid_t+post+2,-1,x,y))
 for x,y in case_mounts:
     lid = lid.cut(cylinder(2.4,lid_t+2,-1,x,y))

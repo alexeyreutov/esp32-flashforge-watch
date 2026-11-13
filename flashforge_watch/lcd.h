@@ -34,15 +34,25 @@ static void paintCamera(const uint8_t *rgb, int w, int h) {
 }
 
 static void screenStatus(bool hasFrame, uint16_t border, int percent,
-                         int secondsLeft, const String &password) {
+                         int secondsLeft, const String &password, const String &phase) {
+  static bool setupVisible = false;
+  static uint16_t lastBorder = 0;
+  static String lastPhase;
   if (!hasFrame) {
-    lcd.fillScreen(ST77XX_BLACK);
+    if (setupVisible && !frameVisible && border==lastBorder && phase==lastPhase) return;
+    if (!setupVisible || frameVisible) {
+      lcd.fillScreen(ST77XX_BLACK);
+      lcd.setTextSize(2); lcd.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
+      lcd.setCursor(4,34); lcd.print("Wi-Fi: Flashforge-Watch");
+      lcd.setCursor(4,64); lcd.print("Key: " + password);
+      lcd.setCursor(4,94); lcd.print("Setup: 192.168.4.1");
+    }
     frameVisible = false;
-    lcd.setTextSize(2); lcd.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
-    lcd.setCursor(4,34); lcd.print("Wi-Fi: Flashforge-Watch");
-    lcd.setCursor(4,64); lcd.print("Key: " + password);
-    lcd.setCursor(4,94); lcd.print("Setup: 192.168.4.1");
+    lcd.fillRect(4,130,312,88,ST77XX_BLACK);
+    lcd.setTextWrap(true); lcd.setCursor(6,136); lcd.print(phase); lcd.setTextWrap(false);
+    setupVisible = true; lastPhase=phase; lastBorder=border;
   } else {
+    setupVisible = false;
     String caption;
     if (percent >= 0) caption = String(percent) + "%";
     if (secondsLeft > 0) {
@@ -55,5 +65,5 @@ static void screenStatus(bool hasFrame, uint16_t border, int percent,
     lcd.setTextSize(2); lcd.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
     lcd.setCursor(6,6); lcd.print(caption);
   }
-  if (border) for (int i=0;i<3;i++) lcd.drawRect(i,i,320-2*i,240-2*i,border);
+  if (border || !hasFrame) for (int i=0;i<3;i++) lcd.drawRect(i,i,320-2*i,240-2*i,border);
 }

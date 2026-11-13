@@ -40,6 +40,7 @@ Settings form{};
 QueueHandle_t pendingSettings;
 SemaphoreHandle_t previewLock;
 String webPhase = "Waiting";
+const char *saveStage = "После запуска запросов ещё не было";
 uint8_t *preview;
 size_t previewLen = 0;
 
@@ -83,11 +84,42 @@ void page() {
     "'></label><h3>Область наблюдения</h3><div class=region>";
   const char *labels[] = {"Слева", "Сверху", "Справа", "Снизу"};
   for (int i=0;i<4;i++) html += "<label>"+String(labels[i])+" (%)<input type=number min=0 max=100 required name=r"+i+" value="+form.box[i]+"></label>";
-  html += "</div><button>Сохранить настройки</button></form></main></html>";
+  html += "</div><button>Сохранить настройки</button> <output aria-live='polite'></output><p>Последнее сохранение: ";
+  html += saveStage;
+  html += F(R"HTML(</p></form></main>
+<script>
+const settings = document.querySelector('form.panel');
+settings.addEventListener('submit', async event => {
+  event.preventDefault();
+  const button = settings.querySelector('button');
+  const feedback = settings.querySelector('output');
+  if (button.disabled) return;
+  button.disabled = true;
+  feedback.textContent = 'Сохранение…';
+  const request = new AbortController();
+  const timeout = setTimeout(() => request.abort(), 10000);
+  try {
+    const response = await fetch(settings.action, {
+      method: 'POST', body: new URLSearchParams(new FormData(settings)),
+      headers: {Accept: 'text/plain'}, signal: request.signal, cache: 'no-store'
+    });
+    const message = await response.text();
+    feedback.textContent = response.ok && message === 'OK'
+      ? 'Настройки сохранены.' : (response.ok ? 'Неожиданный ответ ESP.' : 'Ошибка ' + response.status + ': ' + message);
+  } catch (error) {
+    feedback.textContent = 'Ответ ESP не получен. Проверьте подключение к Flashforge-Watch и откройте форму в новой вкладке для проверки записи.';
+  } finally {
+    clearTimeout(timeout);
+    button.disabled = false;
+  }
+});
+</script></html>)HTML");
   web.sendHeader("Cache-Control","no-store");
   web.send(200,"text/html; charset=utf-8",html);
 }
 void saveConfig() {
+  Serial.println("[save] received");
+  saveStage="Запрос получен, параметры не прошли проверку";
   String ip = web.arg("ip"), sn = web.arg("sn"), code = web.arg("code");
   sn.trim(); code.trim();
   int box[4];
@@ -107,14 +139,24 @@ void saveConfig() {
   sn.toCharArray(next.sn,sizeof next.sn);
   code.toCharArray(next.code,sizeof next.code);
   memcpy(next.box,box,sizeof box);
-  if (prefs.putBytes("config-v1",&next,sizeof next)!=sizeof next) {
+  Settings stored{};
+  Serial.println("[save] writing");
+  if (prefs.putBytes("config-v1",&next,sizeof next)!=sizeof next ||
+      prefs.getBytes("config-v1",&stored,sizeof stored)!=sizeof stored ||
+      memcmp(&next,&stored,sizeof stored)!=0) {
+    Serial.println("[save] storage error");
+    saveStage="Ошибка записи или проверки flash";
     web.send(500,"text/plain; charset=utf-8","Не удалось записать настройки во flash-память ESP.");
     return;
   }
   form=next;
+  saveStage="Запись во flash подтверждена";
   xQueueOverwrite(pendingSettings,&next);
+  Serial.println("[save] verified");
   web.sendHeader("Cache-Control","no-store");
-  web.send(200,"text/html; charset=utf-8","<!doctype html><html lang=ru><meta name=viewport content='width=device-width,initial-scale=1'><title>Flashforge Watch</title><main style='font:18px system-ui;padding:24px;color:#142e33'><h1>Настройки сохранены</h1><a href='/'>Вернуться к мониторингу</a></main></html>");
+  if (web.header("Accept")=="text/plain") web.send(200,"text/plain","OK");
+  else web.send(200,"text/html; charset=utf-8","<!doctype html><html lang=ru><meta name=viewport content='width=device-width,initial-scale=1'><title>Flashforge Watch</title><main style='font:18px system-ui;padding:24px;color:#142e33'><h1>Настройки сохранены</h1><a href='/'>Вернуться к мониторингу</a></main></html>");
+  Serial.println("[save] response sent");
 }
 void applySettings(const Settings &s) {
   addr=s.ip; serialNumber=s.sn; checkCode=s.code;
@@ -287,8 +329,10 @@ void setup() {
   WiFi.softAP("Flashforge-Watch",password.c_str());
   apPassword=password;
 #ifdef WAVESHARE_LCD_2
-  screenStatus(false,0,-1,-1,apPassword);
+  screenStatus(false,0,-1,-1,apPassword,phase);
 #endif
+  const char *requestHeaders[]={"Accept"};
+  web.collectHeaders(requestHeaders,1);
   web.on("/",HTTP_GET,page); web.on("/save",HTTP_POST,saveConfig);
   web.on("/test",HTTP_POST,[](){ beep(250); web.sendHeader("Location","/"); web.send(303); });
   web.on("/last.jpg",HTTP_GET,[](){
@@ -327,7 +371,7 @@ void loop() {
     bool showFrame = active && jpegLen>0;
     uint16_t border = (visualAlarm || failures>0) ? ST77XX_RED :
                       (showFrame && caution) ? ST77XX_YELLOW : 0;
-    screenStatus(showFrame,border,printPercent,secondsLeft,apPassword);
+    screenStatus(showFrame,border,printPercent,secondsLeft,apPassword,phase);
 #endif
     lastPoll=millis();
   }

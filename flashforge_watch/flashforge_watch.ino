@@ -83,29 +83,34 @@ String field(cJSON *obj,const char *key) {
   const char *s=cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj,key));
   return s ? s : "";
 }
-bool status(String &state, String &file, int &layer) {
+String status(String &state, String &file, int &layer) {
   WiFiClient socket; HTTPClient http;
-  http.setConnectTimeout(1200); http.setTimeout(1800); http.useHTTP10(true);
-  if (!http.begin(socket,addr,8898,"/detail")) return false;
+  http.setConnectTimeout(3000); http.setTimeout(5000); http.useHTTP10(true);
+  if (!http.begin(socket,addr,8898,"/detail")) return "Cannot start HTTP client";
   http.addHeader("Content-Type","application/json");
   cJSON *req=cJSON_CreateObject();
-  if (!req) return false;
+  if (!req) return "Status: out of memory";
   cJSON_AddStringToObject(req,"serialNumber",serialNumber.c_str());
   cJSON_AddStringToObject(req,"checkCode",checkCode.c_str());
   char *body=cJSON_PrintUnformatted(req); cJSON_Delete(req);
-  if (!body) return false;
+  if (!body) return "Status: out of memory";
   int rc=http.POST((uint8_t*)body,strlen(body)); cJSON_free(body);
-  if(rc!=200 || http.getSize()>32768) return false;
+  if(rc<0) return addr+":8898 "+HTTPClient::errorToString(rc)+" ("+String(rc)+")";
+  if(rc!=200) return "Status HTTP "+String(rc);
+  if(http.getSize()>32768) return "Status body exceeds 32 KiB";
   String response=http.getString();
   cJSON *root=cJSON_Parse(response.c_str());
-  if(!root) return false;
+  if(!root) return "Status: invalid JSON or incomplete reply";
   cJSON *detail=cJSON_GetObjectItemCaseSensitive(root,"detail");
   cJSON *err=cJSON_GetObjectItemCaseSensitive(root,"code");
   state=field(detail,"status"); file=field(detail,"printFileName");
   cJSON *l=cJSON_GetObjectItemCaseSensitive(detail,"printLayer");
   layer=cJSON_IsNumber(l)?l->valueint:-1;
-  bool ok=(!err || (cJSON_IsNumber(err) && err->valueint==0)) && state.length();
-  cJSON_Delete(root); state.toLowerCase(); return ok;
+  String problem;
+  if (err && !cJSON_IsNumber(err)) problem="Status: unexpected API code format";
+  else if (err && err->valueint!=0) problem="Printer API code "+String(err->valueint);
+  else if (!state.length()) problem="Status: missing detail.status";
+  cJSON_Delete(root); state.toLowerCase(); return problem;
 }
 // Read a single JPEG from mjpg-streamer's first multipart part.
 bool capture() {
@@ -165,7 +170,8 @@ void pollPrinter() {
   if(!jpeg || !rgb) { phase="Memory unavailable: check PSRAM setting"; return; }
   if(!serialNumber.length() || !checkCode.length()) { phase="Enter printer credentials"; return; }
   String state,file; int layer;
-  if(!status(state,file,layer)) { fault("Status unavailable: check IP, LAN mode and check code"); return; }
+  String problem=status(state,file,layer);
+  if(problem.length()) { fault(problem); return; }
   if(state=="error") { fault("Printer reports an error"); return; }
   if(state!="printing") { resetWatch(); failures=0; phase="Printer: "; 
     for (char c : state) if (isalnum((unsigned char)c) || c=='_') phase+=c;

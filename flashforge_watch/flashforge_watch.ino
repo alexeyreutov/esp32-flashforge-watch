@@ -9,11 +9,17 @@
 #ifdef WAVESHARE_LCD_2
 #include "lcd.h"
 String screenKey;
+int printPercent = -1, secondsLeft = -1;
+bool caution = false;
+// Half-resolution RGB for the LCD; the same buffer is reused for analysis.
+constexpr size_t RGB_CAP = 800 * 600 * 3;
+#else
+constexpr size_t RGB_CAP = 200 * 150 * 3;
 #endif
 
 constexpr int BUZZER = 4;  // Active-high, logic-level input on the buzzer module.
 constexpr unsigned long PERIOD = 3000;
-constexpr size_t JPEG_CAP = 192 * 1024, RGB_CAP = 200 * 150 * 3;
+constexpr size_t JPEG_CAP = 192 * 1024;
 WebServer web(80);
 Preferences prefs;
 Vision vision;
@@ -44,18 +50,26 @@ bool printerIP(const String &s) {
   IPAddress ip;
   return ip.fromString(s) && ip[0]==192 && ip[1]==168 && ip[2]==4 && ip[3]>=2 && ip[3]<255;
 }
+String htmlEscape(String s) {
+  s.replace("&","&amp;"); s.replace("'","&#39;"); s.replace("\"","&quot;");
+  s.replace("<","&lt;"); s.replace(">","&gt;"); return s;
+}
 void page() {
-  String html = F("<meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>Flashforge Watch</title><h1>Flashforge Watch</h1><p>");
-  html += phase + "</p><a href='/'>Обновить</a> · <a href='/last.jpg'>Последний кадр</a>"
+  String html = F(R"HTML(<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flashforge Watch</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#edf2f2;color:#142e33;font:16px/1.5 system-ui,sans-serif}main{max-width:680px;margin:auto;padding:28px 16px}section,form.panel{background:white;border:1px solid #cbd8d8;border-radius:16px;padding:20px;margin:14px 0}h1,h2,h3{line-height:1.2;margin:0 0 14px}h1{font-size:clamp(28px,6vw,40px)}h2{font-size:21px}h3{font-size:16px;margin-top:20px}p{overflow-wrap:anywhere}a{color:#00695e;margin-right:14px}label{display:block;font-weight:600;margin:10px 0}input{display:block;width:100%;padding:10px;margin-top:4px;border:1px solid #8babab;border-radius:7px;font:inherit}input:focus-visible,button:focus-visible{outline:3px solid #49bbb1}.region{display:grid;grid-template-columns:repeat(2,1fr);gap:0 12px}button{padding:10px 18px;border:0;border-radius:8px;background:#075f56;color:white;font:inherit;font-weight:600;cursor:pointer}</style>
+<main><h1>Flashforge Watch</h1><section><h2>Состояние принтера</h2><p>)HTML");
+  html += htmlEscape(phase) + "</p><a href='/'>Обновить</a><a href='/last.jpg'>Последний кадр</a></section>"
 #ifndef WAVESHARE_LCD_2
     "<form method=post action='/test'><button>Проверить зуммер</button></form>"
 #endif
-    "<form method=post action='/save'><p>IP принтера <input required name=ip value='" + addr +
-    "'></p><p>Серийный номер <input required name=sn maxlength=80></p>"
-    "<p>LAN check code <input required type=password name=code maxlength=80></p>";
+    "<form class=panel method=post action='/save'><h2>Подключение</h2><label>IP принтера<input required name=ip value='" + htmlEscape(addr) +
+    "'></label><label>Серийный номер<input required name=sn maxlength=80 value='" + htmlEscape(serialNumber) +
+    "'></label><label>LAN check code<input required type=password name=code maxlength=80 value='" + htmlEscape(checkCode) +
+    "'></label><h3>Область наблюдения</h3><div class=region>";
   const char *labels[] = {"Слева", "Сверху", "Справа", "Снизу"};
-  for (int i=0;i<4;i++) html += String(labels[i])+" (%) <input type=number min=0 max=100 required name=r"+i+" value="+roi[i]+"><br>";
-  html += "<button>Сохранить настройки</button></form>";
+  for (int i=0;i<4;i++) html += "<label>"+String(labels[i])+" (%)<input type=number min=0 max=100 required name=r"+i+" value="+roi[i]+"></label>";
+  html += "</div><button>Сохранить настройки</button></form></main></html>";
+  web.sendHeader("Cache-Control","no-store");
   web.send(200,"text/html; charset=utf-8",html);
 }
 void saveConfig() {
@@ -83,6 +97,16 @@ String field(cJSON *obj,const char *key) {
   const char *s=cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj,key));
   return s ? s : "";
 }
+#ifdef WAVESHARE_LCD_2
+double telemetryNumber(cJSON *detail, const char *key) {
+  cJSON *item=cJSON_GetObjectItemCaseSensitive(detail,key);
+  if (cJSON_IsNumber(item)) return item->valuedouble;
+  if (!cJSON_IsString(item)) return NAN;
+  char *end;
+  double value=strtod(item->valuestring,&end);
+  return end!=item->valuestring && !*end ? value : NAN;
+}
+#endif
 String status(String &state, String &file, int &layer) {
   WiFiClient socket; HTTPClient http;
   http.setConnectTimeout(3000); http.setTimeout(5000); http.useHTTP10(true);
@@ -106,6 +130,12 @@ String status(String &state, String &file, int &layer) {
   state=field(detail,"status"); file=field(detail,"printFileName");
   cJSON *l=cJSON_GetObjectItemCaseSensitive(detail,"printLayer");
   layer=cJSON_IsNumber(l)?l->valueint:-1;
+#ifdef WAVESHARE_LCD_2
+  double progress=telemetryNumber(detail,"printProgress");
+  printPercent=progress>=0 && progress<=100 ? lround(progress<=1 ? progress*100 : progress) : -1;
+  double eta=telemetryNumber(detail,"estimatedTime");
+  secondsLeft=eta>0 && eta<=INT_MAX ? int(eta) : -1;
+#endif
   String problem;
   if (err && !cJSON_IsNumber(err)) problem="Status: unexpected API code format";
   else if (err && err->valueint!=0) problem="Printer API code "+String(err->valueint);
@@ -144,10 +174,17 @@ bool measure(Cell (&cells)[Vision::count]) {
   esp_jpeg_image_cfg_t cfg{}; esp_jpeg_image_output_t out{};
   cfg.indata=jpeg; cfg.indata_size=jpegLen; cfg.outbuf=rgb; cfg.outbuf_size=RGB_CAP;
   cfg.out_format=JPEG_IMAGE_FORMAT_RGB888; cfg.out_scale=JPEG_IMAGE_SCALE_1_8;
+#ifdef WAVESHARE_LCD_2
+  cfg.out_scale=JPEG_IMAGE_SCALE_1_2;
+  if (esp_jpeg_decode(&cfg,&out)==ESP_OK && out.width && out.height)
+    paintCamera(rgb,out.width,out.height);
+  else frameVisible=false;
+  cfg.priv.read=0;
+  cfg.out_scale=JPEG_IMAGE_SCALE_1_8;
+#endif
   if(esp_jpeg_decode(&cfg,&out)!=ESP_OK) return false;
 #ifdef WAVESHARE_LCD_2
-  if (!out.width || !out.height) return false;
-  paintCamera(rgb,out.width,out.height);
+  if (!frameVisible && out.width && out.height) paintCamera(rgb,out.width,out.height);
 #endif
   int x0=out.width*roi[0]/100, y0=out.height*roi[1]/100;
   int w=out.width*roi[2]/100-x0, h=out.height*roi[3]/100-y0;
@@ -183,6 +220,9 @@ void pollPrinter() {
   if(!capture() || !measure(cells)) { fault("Camera or JPEG unavailable"); return; }
   failures=0;
   auto score=vision.update(cells);
+#ifdef WAVESHARE_LCD_2
+  caution=!score.ready || score.shifted>0 || score.textured>0;
+#endif
   bool suspect=score.shifted>=5 || score.textured>=4;
   phase=!score.ready?"Learning scene":suspect?"ALARM: persistent visual change":"Watching";
   phase+=" | brightness group="+String(score.shifted)+" | edge group="+String(score.textured);
@@ -209,7 +249,7 @@ void setup() {
   WiFi.softAP("Flashforge-Watch",password.c_str());
 #ifdef WAVESHARE_LCD_2
   screenKey=password;
-  screenStatus(phase,false,-1,false,false,screenKey);
+  screenStatus(false,0,-1,-1,screenKey);
 #endif
   web.on("/",HTTP_GET,page); web.on("/save",HTTP_POST,saveConfig);
   web.on("/test",HTTP_POST,[](){ beep(250); web.sendHeader("Location","/"); web.send(303); });
@@ -231,7 +271,10 @@ void loop() {
   if(millis()-lastPoll>=PERIOD) {
     pollPrinter();
 #ifdef WAVESHARE_LCD_2
-    screenStatus(phase,active,lastLayer,jpegLen>0,visualAlarm || failures>0,screenKey);
+    bool showFrame = active && jpegLen>0;
+    uint16_t border = (visualAlarm || failures>0) ? ST77XX_RED :
+                      (showFrame && caution) ? ST77XX_YELLOW : 0;
+    screenStatus(showFrame,border,printPercent,secondsLeft,screenKey);
 #endif
     lastPoll=millis();
   }

@@ -15,19 +15,16 @@ static void beginScreen() {
 }
 
 static void paintCamera(const uint8_t *rgb, int w, int h) {
-  constexpr int viewWidth = 320, viewHeight = 186;
-  int dw = min(viewWidth, viewHeight*w/h), dh = max(1, dw*h/w);
-  int x0 = (viewWidth-dw)/2, y0 = (viewHeight-dh)/2;
-  static int oldWidth = 0;
-  if (!frameVisible || oldWidth != dw) lcd.fillRect(0,0,320,viewHeight,ST77XX_BLACK);
-  oldWidth = dw;
-  uint16_t line[viewWidth];
+  constexpr int dw = 320, dh = 240;
+  const int cropW = min(w, h*dw/dh), cropH = min(h, w*dh/dw);
+  const int left = (w-cropW)/2, top = (h-cropH)/2;
+  uint16_t line[dw];
   lcd.startWrite();
-  lcd.setAddrWindow(x0,y0,dw,dh);
+  lcd.setAddrWindow(0,0,dw,dh);
   for (int y=0;y<dh;y++) {
-    const uint8_t *row = rgb + 3*w*(y*h/dh);
+    const uint8_t *row = rgb + 3*w*(top+y*cropH/dh);
     for (int x=0;x<dw;x++) {
-      const uint8_t *p = row + 3*(x*w/dw);
+      const uint8_t *p = row + 3*(left+x*cropW/dw);
       line[x] = lcd.color565(p[0],p[1],p[2]);
     }
     lcd.writePixels(line,dw);
@@ -36,25 +33,27 @@ static void paintCamera(const uint8_t *rgb, int w, int h) {
   frameVisible = true;
 }
 
-static void screenStatus(const String &phase, bool printing, int layer,
-                         bool hasFrame, bool warning, const String &password) {
-  if (!hasFrame && frameVisible) {
-    lcd.fillRect(0,0,320,186,ST77XX_BLACK);
-    frameVisible = false;
-  }
+static void screenStatus(bool hasFrame, uint16_t border, int percent,
+                         int secondsLeft, const String &password) {
   if (!hasFrame) {
+    lcd.fillScreen(ST77XX_BLACK);
+    frameVisible = false;
     lcd.setTextSize(2); lcd.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
     lcd.setCursor(4,34); lcd.print("Wi-Fi: Flashforge-Watch");
     lcd.setCursor(4,64); lcd.print("Key: " + password);
     lcd.setCursor(4,94); lcd.print("Setup: 192.168.4.1");
+  } else {
+    String caption;
+    if (percent >= 0) caption = String(percent) + "%";
+    if (secondsLeft > 0) {
+      if (caption.length()) caption += "  ";
+      unsigned minutes = (unsigned(secondsLeft)+59)/60;
+      char eta[24];
+      snprintf(eta,sizeof eta,"ETA %u:%02u",minutes/60,minutes%60);
+      caption += eta;
+    }
+    lcd.setTextSize(2); lcd.setTextColor(ST77XX_WHITE,ST77XX_BLACK);
+    lcd.setCursor(6,6); lcd.print(caption);
   }
-  lcd.fillRect(0,186,320,54,ST77XX_BLACK);
-  lcd.setTextColor(warning ? ST77XX_YELLOW : ST77XX_WHITE);
-  lcd.setTextSize(2); lcd.setCursor(4,190);
-  String title = printing ? "Printing" : "Flashforge Creator 5 Pro";
-  if (printing && layer>=0) title += "  Layer " + String(layer);
-  lcd.print(title);
-  String detail = phase.substring(0,phase.indexOf(" |"));
-  lcd.setCursor(4,216); lcd.setTextSize(detail.length()>25 ? 1 : 2);
-  lcd.setTextWrap(true); lcd.print(detail); lcd.setTextWrap(false);
+  if (border) for (int i=0;i<3;i++) lcd.drawRect(i,i,320-2*i,240-2*i,border);
 }

@@ -8,7 +8,6 @@
 #include "vision.h"
 #ifdef WAVESHARE_LCD_2
 #include "lcd.h"
-String screenKey;
 int printPercent = -1, secondsLeft = -1;
 bool caution = false;
 // Half-resolution RGB for the LCD; the same buffer is reused for analysis.
@@ -24,12 +23,25 @@ WebServer web(80);
 Preferences prefs;
 Vision vision;
 String addr, serialNumber, checkCode, phase = "Waiting", job;
+String apPassword;
 uint8_t *jpeg, *rgb;
 size_t jpegLen = 0;
 uint32_t lastPoll, lastBeep;
 int roi[] = {10, 25, 90, 92}; // left, top, right, bottom, in percent
 int failures = 0, lastLayer = -1;
 bool active = false, visualAlarm = false;
+
+// Web task owns the form and NVS. The printer loop consumes whole snapshots.
+struct Settings {
+  char ip[16], sn[81], code[81];
+  int box[4];
+};
+Settings form{};
+QueueHandle_t pendingSettings;
+SemaphoreHandle_t previewLock;
+String webPhase = "Waiting";
+uint8_t *preview;
+size_t previewLen = 0;
 
 void beep(int ms) {
 #ifndef WAVESHARE_LCD_2
@@ -55,19 +67,22 @@ String htmlEscape(String s) {
   s.replace("<","&lt;"); s.replace(">","&gt;"); return s;
 }
 void page() {
+  xSemaphoreTake(previewLock,portMAX_DELAY);
+  String currentPhase=webPhase;
+  xSemaphoreGive(previewLock);
   String html = F(R"HTML(<!doctype html><html lang="ru"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Flashforge Watch</title>
 <style>*{box-sizing:border-box}body{margin:0;background:#edf2f2;color:#142e33;font:16px/1.5 system-ui,sans-serif}main{max-width:680px;margin:auto;padding:28px 16px}section,form.panel{background:white;border:1px solid #cbd8d8;border-radius:16px;padding:20px;margin:14px 0}h1,h2,h3{line-height:1.2;margin:0 0 14px}h1{font-size:clamp(28px,6vw,40px)}h2{font-size:21px}h3{font-size:16px;margin-top:20px}p{overflow-wrap:anywhere}a{color:#00695e;margin-right:14px}label{display:block;font-weight:600;margin:10px 0}input{display:block;width:100%;padding:10px;margin-top:4px;border:1px solid #8babab;border-radius:7px;font:inherit}input:focus-visible,button:focus-visible{outline:3px solid #49bbb1}.region{display:grid;grid-template-columns:repeat(2,1fr);gap:0 12px}button{padding:10px 18px;border:0;border-radius:8px;background:#075f56;color:white;font:inherit;font-weight:600;cursor:pointer}</style>
 <main><h1>Flashforge Watch</h1><section><h2>Состояние принтера</h2><p>)HTML");
-  html += htmlEscape(phase) + "</p><a href='/'>Обновить</a><a href='/last.jpg'>Последний кадр</a></section>"
+  html += htmlEscape(currentPhase) + "</p><a href='/'>Обновить</a><a href='/last.jpg'>Последний кадр</a></section>"
 #ifndef WAVESHARE_LCD_2
     "<form method=post action='/test'><button>Проверить зуммер</button></form>"
 #endif
-    "<form class=panel method=post action='/save'><h2>Подключение</h2><label>IP принтера<input required name=ip value='" + htmlEscape(addr) +
-    "'></label><label>Серийный номер<input required name=sn maxlength=80 value='" + htmlEscape(serialNumber) +
-    "'></label><label>LAN check code<input required type=password name=code maxlength=80 value='" + htmlEscape(checkCode) +
+    "<form class=panel method=post action='/save'><h2>Подключение</h2><label>IP принтера<input required name=ip value='" + htmlEscape(form.ip) +
+    "'></label><label>Серийный номер<input required name=sn maxlength=80 value='" + htmlEscape(form.sn) +
+    "'></label><label>LAN check code<input required type=password name=code maxlength=80 value='" + htmlEscape(form.code) +
     "'></label><h3>Область наблюдения</h3><div class=region>";
   const char *labels[] = {"Слева", "Сверху", "Справа", "Снизу"};
-  for (int i=0;i<4;i++) html += "<label>"+String(labels[i])+" (%)<input type=number min=0 max=100 required name=r"+i+" value="+roi[i]+"></label>";
+  for (int i=0;i<4;i++) html += "<label>"+String(labels[i])+" (%)<input type=number min=0 max=100 required name=r"+i+" value="+form.box[i]+"></label>";
   html += "</div><button>Сохранить настройки</button></form></main></html>";
   web.sendHeader("Cache-Control","no-store");
   web.send(200,"text/html; charset=utf-8",html);
@@ -87,11 +102,23 @@ void saveConfig() {
       box[2]>100 || box[3]>100 || box[2]-box[0]<20 || box[3]-box[1]<20) {
     web.send(400,"text/plain","Invalid settings"); return;
   }
-  addr=ip; serialNumber=sn; checkCode=code;
-  prefs.putString("ip",addr); prefs.putString("sn",sn); prefs.putString("code",code);
-  memcpy(roi,box,sizeof roi); prefs.putBytes("roi",roi,sizeof roi);
-  resetWatch(); failures=0; phase="Settings saved";
-  web.sendHeader("Location","/"); web.send(303);
+  Settings next{};
+  ip.toCharArray(next.ip,sizeof next.ip);
+  sn.toCharArray(next.sn,sizeof next.sn);
+  code.toCharArray(next.code,sizeof next.code);
+  memcpy(next.box,box,sizeof box);
+  if (prefs.putBytes("config-v1",&next,sizeof next)!=sizeof next) {
+    web.send(500,"text/plain; charset=utf-8","Не удалось записать настройки во flash-память ESP.");
+    return;
+  }
+  form=next;
+  xQueueOverwrite(pendingSettings,&next);
+  web.sendHeader("Cache-Control","no-store");
+  web.send(200,"text/html; charset=utf-8","<!doctype html><html lang=ru><meta name=viewport content='width=device-width,initial-scale=1'><title>Flashforge Watch</title><main style='font:18px system-ui;padding:24px;color:#142e33'><h1>Настройки сохранены</h1><a href='/'>Вернуться к мониторингу</a></main></html>");
+}
+void applySettings(const Settings &s) {
+  addr=s.ip; serialNumber=s.sn; checkCode=s.code;
+  memcpy(roi,s.box,sizeof roi);
 }
 String field(cJSON *obj,const char *key) {
   const char *s=cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(obj,key));
@@ -237,8 +264,19 @@ void setup() {
 #endif
   Serial.begin(115200);
   prefs.begin("ff-watch",false);
-  addr=prefs.getString("ip","192.168.4.2"); serialNumber=prefs.getString("sn","");
-  checkCode=prefs.getString("code",""); prefs.getBytes("roi",roi,sizeof roi);
+  if (prefs.getBytesLength("config-v1")!=sizeof form ||
+      prefs.getBytes("config-v1",&form,sizeof form)!=sizeof form) {
+    prefs.getString("ip","192.168.4.2").toCharArray(form.ip,sizeof form.ip);
+    prefs.getString("sn","").toCharArray(form.sn,sizeof form.sn);
+    prefs.getString("code","").toCharArray(form.code,sizeof form.code);
+    memcpy(form.box,roi,sizeof roi);
+    prefs.getBytes("roi",form.box,sizeof form.box);
+  }
+  applySettings(form);
+  pendingSettings=xQueueCreate(1,sizeof(Settings));
+  previewLock=xSemaphoreCreateMutex();
+  preview=(uint8_t*)ps_malloc(JPEG_CAP);
+  if (!pendingSettings || !previewLock) { Serial.println("Web task allocation failed"); abort(); }
   jpeg=(uint8_t*)ps_malloc(JPEG_CAP); rgb=(uint8_t*)ps_malloc(RGB_CAP);
   WiFi.mode(WIFI_AP);
   String password=prefs.getString("apkey","");
@@ -247,34 +285,49 @@ void setup() {
     password=key; prefs.putString("apkey",password);
   }
   WiFi.softAP("Flashforge-Watch",password.c_str());
+  apPassword=password;
 #ifdef WAVESHARE_LCD_2
-  screenKey=password;
-  screenStatus(false,0,-1,-1,screenKey);
+  screenStatus(false,0,-1,-1,apPassword);
 #endif
   web.on("/",HTTP_GET,page); web.on("/save",HTTP_POST,saveConfig);
   web.on("/test",HTTP_POST,[](){ beep(250); web.sendHeader("Location","/"); web.send(303); });
   web.on("/last.jpg",HTTP_GET,[](){
-    if(!jpegLen) { web.send(404,"text/plain","No current frame"); return; }
-    web.sendHeader("Cache-Control","no-store");
-    web.send_P(200,"image/jpeg",(const char*)jpeg,jpegLen);
+    xSemaphoreTake(previewLock,portMAX_DELAY);
+    if (previewLen) {
+      web.sendHeader("Cache-Control","no-store");
+      web.send_P(200,"image/jpeg",(const char*)preview,previewLen);
+    } else web.send(404,"text/plain","No current frame");
+    xSemaphoreGive(previewLock);
   });
   web.begin();
+  if (xTaskCreate([](void*) {
+    for (;;) { web.handleClient(); vTaskDelay(1); }
+  },"ff-web",8192,nullptr,1,nullptr)!=pdPASS) abort();
 }
 void loop() {
   static uint32_t lastInfo=0; static bool shown=false;
   if(!shown || millis()-lastInfo>=15000) {
     Serial.printf("AP Flashforge-Watch | password %s | http://192.168.4.1 | %s\n",
-                  prefs.getString("apkey","").c_str(),phase.c_str());
+                  apPassword.c_str(),phase.c_str());
     shown=true; lastInfo=millis();
   }
-  web.handleClient();
+  Settings next;
+  if (xQueueReceive(pendingSettings,&next,0)==pdTRUE) {
+    applySettings(next);
+    resetWatch(); failures=0; lastPoll=millis()-PERIOD;
+  }
   if(millis()-lastPoll>=PERIOD) {
     pollPrinter();
+    if (xSemaphoreTake(previewLock,0)==pdTRUE) {
+      webPhase=phase; previewLen=preview ? jpegLen : 0;
+      if (previewLen) memcpy(preview,jpeg,previewLen);
+      xSemaphoreGive(previewLock);
+    }
 #ifdef WAVESHARE_LCD_2
     bool showFrame = active && jpegLen>0;
     uint16_t border = (visualAlarm || failures>0) ? ST77XX_RED :
                       (showFrame && caution) ? ST77XX_YELLOW : 0;
-    screenStatus(showFrame,border,printPercent,secondsLeft,screenKey);
+    screenStatus(showFrame,border,printPercent,secondsLeft,apPassword);
 #endif
     lastPoll=millis();
   }

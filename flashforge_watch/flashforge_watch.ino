@@ -5,15 +5,15 @@
 #include <esp_random.h>
 #include <jpeg_decoder.h>
 #include <cJSON.h>
-#include "vision.h"
+#include "frame_analysis.h"
 #ifdef WAVESHARE_LCD_2
 #include "lcd.h"
 int printPercent = -1, secondsLeft = -1;
 bool caution = false;
-// Half-resolution RGB for the LCD; the same buffer is reused for analysis.
+// Shared RGB image for the display and the detector.
 constexpr size_t RGB_CAP = 800 * 600 * 3;
 #else
-constexpr size_t RGB_CAP = 200 * 150 * 3;
+constexpr size_t RGB_CAP = 400 * 300 * 3;
 #endif
 
 constexpr int BUZZER = 4;  // Active-high, logic-level input on the buzzer module.
@@ -131,7 +131,7 @@ void saveConfig() {
     box[i]=v.toInt();
   }
   if (!printerIP(ip) || !sn.length() || sn.length()>80 || !code.length() || code.length()>80 ||
-      box[2]>100 || box[3]>100 || box[2]-box[0]<20 || box[3]-box[1]<20) {
+      box[2]>100 || box[3]>100 || box[2]-box[0]<10 || box[3]-box[1]<8) {
     web.send(400,"text/plain","Invalid settings"); return;
   }
   Settings next{};
@@ -238,39 +238,21 @@ bool capture() {
   }
   return false;
 }
-int light(const uint8_t *p) { return (p[0]*77+p[1]*150+p[2]*29)>>8; }
-bool measure(Cell (&cells)[Vision::count]) {
-  esp_jpeg_image_cfg_t cfg{}; esp_jpeg_image_output_t out{};
+bool measure(Cell (&cells)[Vision::count], View &view) {
+  esp_jpeg_image_cfg_t cfg{};
+  esp_jpeg_image_output_t out{};
   cfg.indata=jpeg; cfg.indata_size=jpegLen; cfg.outbuf=rgb; cfg.outbuf_size=RGB_CAP;
-  cfg.out_format=JPEG_IMAGE_FORMAT_RGB888; cfg.out_scale=JPEG_IMAGE_SCALE_1_8;
+  cfg.out_format=JPEG_IMAGE_FORMAT_RGB888;
+  for (auto scale : {JPEG_IMAGE_SCALE_1_2, JPEG_IMAGE_SCALE_1_4, JPEG_IMAGE_SCALE_1_8}) {
+    cfg.out_scale=scale; cfg.priv.read=0;
+    if (esp_jpeg_decode(&cfg,&out)!=ESP_OK || !out.width || !out.height) continue;
 #ifdef WAVESHARE_LCD_2
-  cfg.out_scale=JPEG_IMAGE_SCALE_1_2;
-  if (esp_jpeg_decode(&cfg,&out)==ESP_OK && out.width && out.height)
     paintCamera(rgb,out.width,out.height);
-  else frameVisible=false;
-  cfg.priv.read=0;
-  cfg.out_scale=JPEG_IMAGE_SCALE_1_8;
 #endif
-  if(esp_jpeg_decode(&cfg,&out)!=ESP_OK) return false;
-#ifdef WAVESHARE_LCD_2
-  if (!frameVisible && out.width && out.height) paintCamera(rgb,out.width,out.height);
-#endif
-  int x0=out.width*roi[0]/100, y0=out.height*roi[1]/100;
-  int w=out.width*roi[2]/100-x0, h=out.height*roi[3]/100-y0;
-  if(w<Vision::cols*2 || h<Vision::rows*2) return false;
-  for(int r=0;r<Vision::rows;r++) for(int c=0;c<Vision::cols;c++) {
-    int sum=0, edges=0, pixels=0;
-    for(int y=y0+h*r/Vision::rows;y<y0+h*(r+1)/Vision::rows;y++)
-      for(int x=x0+w*c/Vision::cols;x<x0+w*(c+1)/Vision::cols;x++) {
-        const uint8_t *p=rgb+3*(y*out.width+x);
-        int value=light(p);
-        bool edge=(x>x0 && abs(value-light(p-3))>24) ||
-                  (y>y0 && abs(value-light(p-3*out.width))>24);
-        sum+=value; edges+=edge; ++pixels;
-      }
-    cells[r*Vision::cols+c]={sum/pixels,100*edges/pixels};
+    view=readRegion(rgb,out.width,out.height,roi,cells);
+    return true;
   }
-  return true;
+  return false;
 }
 void pollPrinter() {
   if(!jpeg || !rgb) { phase="Memory unavailable: check PSRAM setting"; return; }
@@ -286,8 +268,17 @@ void pollPrinter() {
   if(!active || file!=job || (layer>=0 && lastLayer>layer)) resetWatch();
   active=true; job=file; lastLayer=layer;
   Cell cells[Vision::count];
-  if(!capture() || !measure(cells)) { fault("Camera or JPEG unavailable"); return; }
+  View view;
+  if(!capture() || !measure(cells,view)) { fault("Camera or JPEG unavailable"); return; }
   failures=0;
+  if (view!=View::clear) {
+#ifdef WAVESHARE_LCD_2
+    caution=true;
+#endif
+    phase=view==View::covered ? "Waiting for a clear view" : "Analysis region too small";
+    if (visualAlarm) phase+=" | Previous alarm active";
+    return;
+  }
   auto score=vision.update(cells);
 #ifdef WAVESHARE_LCD_2
   caution=!score.ready || score.shifted>0 || score.textured>0;
